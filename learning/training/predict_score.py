@@ -24,6 +24,27 @@ from Utils import *
 from datareader import *
 
 
+OBS_CROP_BATCH = 16
+
+
+def warp_observation_crops(source_chw, tf_to_crops, render_size, mode, chunk_size=OBS_CROP_BATCH):
+  """Warp full-frame observation data into pose-conditioned crops in chunks."""
+  crops = []
+  B = len(tf_to_crops)
+  for b in range(0, B, chunk_size):
+    e = min(B, b + chunk_size)
+    crops.append(
+      kornia.geometry.transform.warp_perspective(
+        source_chw[None].expand(e - b, -1, -1, -1),
+        tf_to_crops[b:e],
+        dsize=render_size,
+        mode=mode,
+        align_corners=False,
+      )
+    )
+  return torch.cat(crops, dim=0)
+
+
 def vis_batch_data_scores(pose_data, ids, scores, pad_margin=5):
   assert len(scores)==len(ids)
   canvas = []
@@ -86,8 +107,29 @@ def make_crop_data_batch(render_size, ob_in_cams, mesh, rgb, depth, K, crop_rati
   xyz_map_rs = torch.cat(xyz_map_rs, dim=0).permute(0,3,1,2)  #(B,3,H,W)
   logging.info("render done")
 
-  rgbBs = kornia.geometry.transform.warp_perspective(torch.as_tensor(rgb, dtype=torch.float, device='cuda').permute(2,0,1)[None].expand(B,-1,-1,-1), tf_to_crops, dsize=render_size, mode='bilinear', align_corners=False)
-  depthBs = kornia.geometry.transform.warp_perspective(torch.as_tensor(depth, dtype=torch.float, device='cuda')[None,None].expand(B,-1,-1,-1), tf_to_crops, dsize=render_size, mode='nearest', align_corners=False)
+  rgbBs = warp_observation_crops(
+    torch.as_tensor(rgb, dtype=torch.float, device='cuda').permute(2,0,1),
+    tf_to_crops,
+    render_size,
+    mode='bilinear',
+  )
+  depthBs = warp_observation_crops(
+    torch.as_tensor(depth, dtype=torch.float, device='cuda')[None],
+    tf_to_crops,
+    render_size,
+    mode='nearest',
+  )
+  xyz_map_full = depth2xyzmap_batch(
+    torch.as_tensor(depth, dtype=torch.float, device='cuda')[None],
+    torch.as_tensor(K, dtype=torch.float, device='cuda').reshape(1,3,3),
+    zfar=np.inf,
+  )[0].permute(2,0,1)
+  xyz_mapBs = warp_observation_crops(
+    xyz_map_full,
+    tf_to_crops,
+    render_size,
+    mode='nearest',
+  )
   if rgb_rs.shape[-2:]!=cfg['input_resize']:
     rgbAs = kornia.geometry.transform.warp_perspective(rgb_rs, tf_to_crops, dsize=render_size, mode='bilinear', align_corners=False)
     depthAs = kornia.geometry.transform.warp_perspective(depth_rs, tf_to_crops, dsize=render_size, mode='nearest', align_corners=False)
@@ -106,7 +148,7 @@ def make_crop_data_batch(render_size, ob_in_cams, mesh, rgb, depth, K, crop_rati
   Ks = torch.as_tensor(K, dtype=torch.float).reshape(1,3,3).expand(len(rgbAs),3,3)
   mesh_diameters = torch.ones((len(rgbAs)), dtype=torch.float, device='cuda')*mesh_diameter
 
-  pose_data = BatchPoseData(rgbAs=rgbAs, rgbBs=rgbBs, depthAs=depthAs, depthBs=depthBs, normalAs=normalAs, normalBs=normalBs, poseA=poseAs, xyz_mapAs=xyz_mapAs, tf_to_crops=tf_to_crops, Ks=Ks, mesh_diameters=mesh_diameters)
+  pose_data = BatchPoseData(rgbAs=rgbAs, rgbBs=rgbBs, depthAs=depthAs, depthBs=depthBs, normalAs=normalAs, normalBs=normalBs, poseA=poseAs, xyz_mapAs=xyz_mapAs, xyz_mapBs=xyz_mapBs, tf_to_crops=tf_to_crops, Ks=Ks, mesh_diameters=mesh_diameters)
   pose_data = dataset.transform_batch(pose_data, H_ori=H, W_ori=W, bound=1)
 
   logging.info("pose batch data done")
@@ -224,4 +266,3 @@ class ScorePredictor:
       return scores, canvas
 
     return scores, None
-

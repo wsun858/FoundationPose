@@ -21,6 +21,27 @@ from Utils import *
 from datareader import *
 
 
+OBS_CROP_BATCH = 16
+
+
+def warp_observation_crops(source_chw, tf_to_crops, render_size, mode, chunk_size=OBS_CROP_BATCH):
+  """Warp full-frame observation data into pose-conditioned crops in chunks."""
+  crops = []
+  B = len(tf_to_crops)
+  for b in range(0, B, chunk_size):
+    e = min(B, b + chunk_size)
+    crops.append(
+      kornia.geometry.transform.warp_perspective(
+        source_chw[None].expand(e - b, -1, -1, -1),
+        tf_to_crops[b:e],
+        dsize=render_size,
+        mode=mode,
+        align_corners=False,
+      )
+    )
+  return torch.cat(crops, dim=0)
+
+
 
 @torch.inference_mode()
 def make_crop_data_batch(render_size, ob_in_cams, mesh, rgb, depth, K, crop_ratio, xyz_map, normal_map=None, mesh_diameter=None, cfg=None, glctx=None, mesh_tensors=None, dataset:PoseRefinePairH5Dataset=None):
@@ -60,7 +81,12 @@ def make_crop_data_batch(render_size, ob_in_cams, mesh, rgb, depth, K, crop_rati
 
   logging.info("render done")
 
-  rgbBs = kornia.geometry.transform.warp_perspective(torch.as_tensor(rgb, dtype=torch.float, device='cuda').permute(2,0,1)[None].expand(B,-1,-1,-1), tf_to_crops, dsize=render_size, mode='bilinear', align_corners=False)
+  rgbBs = warp_observation_crops(
+    torch.as_tensor(rgb, dtype=torch.float, device='cuda').permute(2,0,1),
+    tf_to_crops,
+    render_size,
+    mode='bilinear',
+  )
   if rgb_rs.shape[-2:]!=cfg['input_resize']:
     rgbAs = kornia.geometry.transform.warp_perspective(rgb_rs, tf_to_crops, dsize=render_size, mode='bilinear', align_corners=False)
   else:
@@ -69,11 +95,21 @@ def make_crop_data_batch(render_size, ob_in_cams, mesh, rgb, depth, K, crop_rati
     xyz_mapAs = kornia.geometry.transform.warp_perspective(xyz_map_rs, tf_to_crops, dsize=render_size, mode='nearest', align_corners=False)
   else:
     xyz_mapAs = xyz_map_rs
-  xyz_mapBs = kornia.geometry.transform.warp_perspective(torch.as_tensor(xyz_map, device='cuda', dtype=torch.float).permute(2,0,1)[None].expand(B,-1,-1,-1), tf_to_crops, dsize=render_size, mode='nearest', align_corners=False)  #(B,3,H,W)
+  xyz_mapBs = warp_observation_crops(
+    torch.as_tensor(xyz_map, device='cuda', dtype=torch.float).permute(2,0,1),
+    tf_to_crops,
+    render_size,
+    mode='nearest',
+  )  #(B,3,H,W)
 
   if cfg['use_normal']:
     normalAs = kornia.geometry.transform.warp_perspective(normal_rs, tf_to_crops, dsize=render_size, mode='nearest', align_corners=False)
-    normalBs = kornia.geometry.transform.warp_perspective(torch.as_tensor(normal_map, dtype=torch.float, device='cuda').permute(2,0,1)[None].expand(B,-1,-1,-1), tf_to_crops, dsize=render_size, mode='nearest', align_corners=False)
+    normalBs = warp_observation_crops(
+      torch.as_tensor(normal_map, dtype=torch.float, device='cuda').permute(2,0,1),
+      tf_to_crops,
+      render_size,
+      mode='nearest',
+    )
   else:
     normalAs = None
     normalBs = None
@@ -293,4 +329,3 @@ class PoseRefinePredictor:
       return B_in_cams_out, canvas
 
     return B_in_cams_out, None
-
